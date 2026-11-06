@@ -44,28 +44,35 @@ router.get('/summary', async (req: Request, res: Response, next: NextFunction) =
       })),
     ]);
 
-    const totalEventsCount = Number(initEvents.totalMatches || 0);
-    const latestPos = Math.max(0, totalEventsCount - 100);
-    const eventsResult = await eventsService.searchEvents({ position: latestPos, maxResults: 100 }).catch(() => ({
-      totalMatches: totalEventsCount,
-      numOfMatches: 0,
-      events: [],
-    }));
-
     const todayStr = (req.query.date as string) || new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Kolkata' }).format(new Date());
-    const todayEvents = eventsResult.events.filter((e) => e.deviceDate === todayStr);
 
-    // Verified attendance punches: major 5 with minor 38 (auth passed), minor 6, or minor 104
+    const totalEventsCount = Number(initEvents.totalMatches || 0);
+    const latestPos = Math.max(0, totalEventsCount - 30);
+    const [recentBuffer, todayEvents] = await Promise.all([
+      eventsService.searchEvents({ position: latestPos, maxResults: 30 }).catch(() => ({
+        totalMatches: totalEventsCount,
+        numOfMatches: 0,
+        events: [],
+      })),
+      eventsService.fetchAllEvents({
+        startTime: `${todayStr}T00:00:00`,
+        endTime: `${todayStr}T23:59:59`,
+      }).catch(() => []),
+    ]);
+
+    // Verified attendance punches: major 5 with minor 38, 75 (face passed), 104, 1 with employeeNo
+    const verifiedMinors = [38, 75, 104, 1];
     const verifiedAuthToday = todayEvents.filter(
-      (e) => e.major === 5 && (e.minor === 38 || e.minor === 6 || e.minor === 104) && e.employeeNo
+      (e) => e.major === 5 && verifiedMinors.includes(e.minor) && e.employeeNo && e.employeeNo !== 'N/A'
     );
 
     const uniqueEmployeesPresent = new Set(verifiedAuthToday.map((e) => String(e.employeeNo))).size;
+    const failedMinors = [39, 76, 78, 33, 34, 37, 6, 7];
     const failedAttempts = todayEvents.filter(
-      (e) => e.major === 5 && [39, 76, 78, 33, 34, 37].includes(e.minor)
+      (e) => e.major === 5 && failedMinors.includes(e.minor)
     ).length;
 
-    const recentEvents = [...eventsResult.events]
+    const recentEvents = [...recentBuffer.events]
       .reverse()
       .slice(0, 10)
       .map((ev) => ({
@@ -101,7 +108,7 @@ router.get('/summary', async (req: Request, res: Response, next: NextFunction) =
           fingerprintUsers: userCounts.bindFingerprintUserNumber,
           faceUsers: userCounts.bindFaceUserNumber,
           cardUsers: userCounts.bindCardUserNumber,
-          totalEvents: eventsResult.totalMatches,
+          totalEvents: totalEventsCount,
           todayEvents: verifiedAuthToday.length,
           rawTodayEvents: todayEvents.length,
           presentToday: uniqueEmployeesPresent,

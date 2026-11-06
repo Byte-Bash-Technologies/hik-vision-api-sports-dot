@@ -1,6 +1,7 @@
 import { Router, Request, Response, NextFunction } from 'express';
 import { HikvisionClient, HikvisionUsers } from '../hikvision';
 import { config } from '../config';
+import { scanEnforcerService } from '../services/scanEnforcer.service';
 
 const router = Router();
 
@@ -77,7 +78,7 @@ router.get('/', async (req: Request, res: Response, next: NextFunction) => {
  */
 router.post('/', async (req: Request, res: Response, next: NextFunction) => {
   try {
-    const { employeeNo, name, userType, validFrom, validTo, enabled, gender, doorNo } = req.body;
+    const { employeeNo, name, userType, validFrom, validTo, enabled, gender, doorNo, planTemplateNo } = req.body;
 
     if (!employeeNo || !name) {
       res.status(400).json({
@@ -96,7 +97,11 @@ router.post('/', async (req: Request, res: Response, next: NextFunction) => {
       enabled: enabled !== false,
       gender,
       doorNo: doorNo || 1,
+      planTemplateNo,
     });
+
+    // Grant enrollment test credit so reception verification scan does not consume daily checkin
+    scanEnforcerService.grantEnrollmentCredit(String(employeeNo));
 
     res.status(201).json({
       success: true,
@@ -264,6 +269,7 @@ router.post('/:employeeNo/grant', async (req: Request, res: Response, next: Next
     const validTo = new Date(Date.now() + days * 24 * 3600 * 1000).toISOString().slice(0, 19);
 
     await usersService.updateAccessPeriod(employeeNo, validFrom, validTo, true);
+    scanEnforcerService.grantEnrollmentCredit(String(employeeNo));
 
     res.json({
       success: true,
@@ -298,6 +304,7 @@ router.post('/:employeeNo/access-period', async (req: Request, res: Response, ne
       validTo,
       enabled !== false
     );
+    scanEnforcerService.grantEnrollmentCredit(String(employeeNo));
 
     res.json({
       success: true,
@@ -315,6 +322,33 @@ router.post('/:employeeNo/access-period', async (req: Request, res: Response, ne
 });
 
 /**
+ * POST /api/users/:employeeNo/unlock
+ * Immediately resets a user's beginTime to today and gives them a 2-hour exemption
+ * Useful when a member is locked out by 1-scan-per-day or needs test entry
+ */
+router.post('/:employeeNo/unlock', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const employeeNo = req.params.employeeNo;
+    const ok = await scanEnforcerService.resetUserToToday(employeeNo);
+    if (!ok) {
+      res.status(404).json({
+        success: false,
+        error: { code: 'USER_NOT_FOUND', message: `User ${employeeNo} not found` },
+      });
+      return;
+    }
+
+    res.json({
+      success: true,
+      message: `User ${employeeNo} unlocked for today and exempted for 2 hours`,
+      data: { employeeNo, unlocked: true },
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+/**
  * POST /api/users/:employeeNo/fingerprint/capture
  * Interactive Fingerprint Capture & Save
  * Triggers physical terminal sensor to capture finger and saves template to employee profile
@@ -325,6 +359,7 @@ router.post('/:employeeNo/fingerprint/capture', async (req: Request, res: Respon
     const fingerPrintID = req.body?.fingerPrintID ? Number(req.body.fingerPrintID) : 1;
 
     const result = await usersService.captureAndSaveFingerprint(employeeNo, fingerPrintID);
+    scanEnforcerService.grantEnrollmentCredit(String(employeeNo));
 
     res.json({
       success: true,

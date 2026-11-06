@@ -20,19 +20,31 @@ import { scheduleConfigState } from '../services/scheduleStore';
  * Helper to map raw event to rich HikAttendanceEvent with Shift tagging
  */
 function mapToHikAttendanceEvent(ev: any) {
-  const isFailed = ev.major === 5 && [39, 76, 78, 33, 34, 37].includes(ev.minor);
+  const failedMinors = [39, 76, 78, 33, 34, 37, 6, 7, 8, 9];
+  const isFailed = ev.major === 5 && failedMinors.includes(ev.minor);
+  const isSuccess = ev.major === 5 && [38, 75, 104, 1].includes(ev.minor);
+  const isDoorEvent = ev.major === 5 && [21, 22].includes(ev.minor);
 
   // Calculate shift from punch time (e.g. "07:15:30")
   const timeStr = ev.deviceTime || '';
   const hour = parseInt(timeStr.slice(0, 2), 10);
   let shift: 'MORNING' | 'EVENING' | 'OTHER' = 'OTHER';
   if (!isNaN(hour)) {
-    if (hour >= 4 && hour < 14) {
+    if (hour >= 4 && hour < 13) {
       shift = 'MORNING';
-    } else if (hour >= 14 && hour < 24) {
+    } else if (hour >= 13 && hour < 23) {
       shift = 'EVENING';
     }
   }
+
+  const status = isFailed ? 'FAILED' : 'SUCCESS';
+  const statusLabel = isFailed
+    ? (ev.minor === 8 ? 'Access Denied (Invalid Time)' : ev.minor === 9 ? 'Access Denied (Expired)' : 'Access Denied')
+    : isSuccess
+    ? 'Access Granted'
+    : isDoorEvent
+    ? (ev.minor === 21 ? 'Door Unlocked' : 'Door Locked')
+    : ev.description;
 
   return {
     id: ev.id,
@@ -48,8 +60,8 @@ function mapToHikAttendanceEvent(ev: any) {
     shiftLabel: shift === 'MORNING' ? 'Morning Shift' : shift === 'EVENING' ? 'Evening Shift' : 'General',
     major: ev.major,
     minor: ev.minor,
-    status: isFailed ? 'FAILED' : 'SUCCESS',
-    statusLabel: isFailed ? 'Access Denied' : 'Access Granted',
+    status,
+    statusLabel,
     eventCategory: ev.category,
     eventDescription: ev.description,
     verificationMode: ev.verifyMode,
@@ -80,21 +92,37 @@ router.get('/', async (req: Request, res: Response, next: NextFunction) => {
     const employeeNo = (req.query.employeeNo as string) || (req.query.employeeNoString as string);
     const search = req.query.search as string | undefined;
 
-    const result = await eventsService.searchEvents({
-      position,
-      maxResults: Math.max(maxResults, 50),
-      startTime,
-      endTime,
-      employeeNo,
-    });
+    let rawEvents: any[];
+    let totalCount = 0;
 
-    let mapped = result.events.map(mapToHikAttendanceEvent);
+    if (filterDate) {
+      const allDay = await eventsService.fetchAllEvents({
+        startTime,
+        endTime,
+        employeeNo,
+      });
+      totalCount = allDay.length;
+      allDay.sort((a, b) => new Date(b.time).getTime() - new Date(a.time).getTime());
+      rawEvents = allDay.slice(position, position + maxResults);
+    } else {
+      const init = await eventsService.searchEvents({ maxResults: 1 });
+      const overallTotal = Number(init.totalMatches || 0);
+      const pos = Math.max(0, overallTotal - (position + maxResults));
+      const result = await eventsService.searchEvents({
+        position: pos,
+        maxResults,
+        employeeNo,
+      });
+      totalCount = overallTotal;
+      rawEvents = [...result.events].reverse();
+    }
+
+    let mapped = rawEvents.map(mapToHikAttendanceEvent);
 
     if (filterDate) {
       mapped = mapped.filter((ev) => ev.dateFormatted === filterDate);
     }
-    // Sort latest events first so newest punches appear at the top
-    mapped.sort((a, b) => new Date(b.eventTime).getTime() - new Date(a.eventTime).getTime());
+
     if (shift && shift !== 'ALL') {
       if (shift === 'MORNING') {
         mapped = mapped.filter((ev) => ev.shift === 'MORNING');
@@ -122,8 +150,8 @@ router.get('/', async (req: Request, res: Response, next: NextFunction) => {
       pagination: {
         page: Math.floor(position / maxResults) + 1,
         limit: maxResults,
-        total: date ? mapped.length : result.totalMatches,
-        totalPages: Math.ceil((date ? mapped.length : result.totalMatches) / maxResults) || 1,
+        total: totalCount,
+        totalPages: Math.ceil(totalCount / maxResults) || 1,
       },
     });
   } catch (error) {
@@ -164,14 +192,16 @@ router.get('/recent', async (req: Request, res: Response, next: NextFunction) =>
   try {
     const limit = req.query.limit ? parseInt(req.query.limit as string, 10) : 20;
 
+    const init = await eventsService.searchEvents({ maxResults: 1 });
+    const total = Number(init.totalMatches || 0);
+    const pos = Math.max(0, total - limit);
+
     const result = await eventsService.searchEvents({
-      position: 0,
+      position: pos,
       maxResults: limit,
     });
 
-    const sorted = [...result.events].sort(
-      (a, b) => new Date(b.time).getTime() - new Date(a.time).getTime()
-    );
+    const sorted = [...result.events].reverse();
 
     res.json({
       success: true,
@@ -189,31 +219,37 @@ router.get('/recent', async (req: Request, res: Response, next: NextFunction) =>
  */
 router.get('/summary', async (req: Request, res: Response, next: NextFunction) => {
   try {
-    const events = await eventsService.fetchAllEvents({ maxResults: 100 });
-
     const targetDate = (req.query.date as string) || new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Kolkata' }).format(new Date());
-    const dayEvents = events.filter((e) => e.deviceDate === targetDate);
 
+    const events = await eventsService.fetchAllEvents({
+      startTime: `${targetDate}T00:00:00`,
+      endTime: `${targetDate}T23:59:59`,
+    });
+
+    const dayEvents = events.filter((e) => e.deviceDate === targetDate || !e.deviceDate);
+
+    const verifiedMinors = [38, 75, 104, 1];
     const verifiedAuth = dayEvents.filter(
-      (e) => e.major === 5 && (e.minor === 38 || e.minor === 6 || e.minor === 104 || e.minor === 75) && e.employeeNo
+      (e) => e.major === 5 && verifiedMinors.includes(e.minor) && e.employeeNo && e.employeeNo !== 'N/A'
     );
 
     const uniqueEmployeesPresent = new Set(verifiedAuth.map((e) => String(e.employeeNo))).size;
 
     const morningEvents = verifiedAuth.filter((e) => {
       const h = parseInt((e.deviceTime || '').slice(0, 2), 10);
-      return !isNaN(h) && h >= 4 && h < 14;
+      return !isNaN(h) && h >= 4 && h < 13;
     });
     const morningPresent = new Set(morningEvents.map((e) => String(e.employeeNo))).size;
 
     const eveningEvents = verifiedAuth.filter((e) => {
       const h = parseInt((e.deviceTime || '').slice(0, 2), 10);
-      return !isNaN(h) && h >= 14 && h < 24;
+      return !isNaN(h) && h >= 13 && h < 23;
     });
     const eveningPresent = new Set(eveningEvents.map((e) => String(e.employeeNo))).size;
 
+    const failedMinors = [39, 76, 78, 33, 34, 37, 6, 7];
     const failedAttempts = dayEvents.filter(
-      (e) => e.major === 5 && [39, 76, 78, 33, 34, 37].includes(e.minor)
+      (e) => e.major === 5 && failedMinors.includes(e.minor)
     ).length;
 
     res.json({
@@ -254,8 +290,16 @@ router.get('/user/:employeeNo', async (req: Request, res: Response, next: NextFu
     const employeeNo = req.params.employeeNo;
     const limit = req.query.limit ? parseInt(req.query.limit as string, 10) : 50;
 
-    // Search events specifically for this employee
+    const init = await eventsService.searchEvents({
+      maxResults: 1,
+      employeeNo,
+    });
+
+    const total = Number(init.totalMatches || 0);
+    const pos = Math.max(0, total - limit);
+
     const result = await eventsService.searchEvents({
+      position: pos,
       maxResults: limit,
       employeeNo,
     });
@@ -263,7 +307,7 @@ router.get('/user/:employeeNo', async (req: Request, res: Response, next: NextFu
     let events = result.events;
     // Fallback if terminal didn't filter in hardware condition
     if (events.length === 0 || events.some((e) => e.employeeNo && String(e.employeeNo) !== String(employeeNo))) {
-      const allEvents = await eventsService.fetchAllEvents({ maxResults: 50 });
+      const allEvents = await eventsService.fetchAllEvents();
       events = allEvents.filter((ev) => String(ev.employeeNo) === String(employeeNo));
     }
 

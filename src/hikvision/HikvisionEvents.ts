@@ -142,15 +142,19 @@ export class HikvisionEvents {
 
   public async fetchAllEvents(options: Omit<SearchEventsOptions, 'position'> = {}): Promise<FormattedEventItem[]> {
     const allEvents: FormattedEventItem[] = [];
-    const batchSize = options.maxResults ?? 30;
+    const targetLimit = options.maxResults;
+    const batchSize = 30; // Hikvision terminal max matches per page is 30
     let position = 0;
     let total = Infinity;
 
     while (position < total) {
+      const remaining = targetLimit ? targetLimit - allEvents.length : batchSize;
+      if (remaining <= 0) break;
+
       const result = await this.searchEvents({
         ...options,
         position,
-        maxResults: batchSize,
+        maxResults: Math.min(remaining, batchSize),
       });
 
       if (!result.events || result.events.length === 0) {
@@ -161,7 +165,7 @@ export class HikvisionEvents {
       total = result.totalMatches;
       position += result.events.length;
 
-      if (result.events.length < batchSize || position >= total) {
+      if (position >= total || (targetLimit && allEvents.length >= targetLimit)) {
         break;
       }
     }

@@ -10,6 +10,9 @@ export class ScanEnforcerService {
   private deviceService: HikvisionDevice;
   private isEnforcing = false;
 
+  // Tracks newly enrolled members who get 1 test scan at reception before daily lockout starts (employeeNo -> YYYY-MM-DD)
+  private enrollmentCredits = new Map<string, string>();
+
   constructor() {
     this.client = new HikvisionClient({
       host: config.HIKVISION_HOST,
@@ -21,6 +24,17 @@ export class ScanEnforcerService {
     this.eventsService = new HikvisionEvents(this.client);
     this.usersService = new HikvisionUsers(this.client);
     this.deviceService = new HikvisionDevice(this.client);
+  }
+
+  /**
+   * Grant 1 enrollment test credit to a member upon creation or biometric capture.
+   * This ensures their test tap at the front desk does not consume their daily entrance scan.
+   */
+  public grantEnrollmentCredit(employeeNo: string): void {
+    const key = String(employeeNo);
+    const today = new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Kolkata' }).format(new Date());
+    this.enrollmentCredits.set(key, today);
+    logger.info(`[ScanEnforcer] User ${key} granted 1 enrollment test credit for ${today} (1 test + 1 checkin allowed today).`);
   }
 
   /**
@@ -37,7 +51,7 @@ export class ScanEnforcerService {
     const enforcedUsers: string[] = [];
 
     try {
-      // 1. Get current date in IST / local terminal timezone
+      // 1. Get current date in local terminal timezone
       const now = new Date();
       const datePart = new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Kolkata' }).format(now);
 
@@ -46,16 +60,18 @@ export class ScanEnforcerService {
       const tomorrowDatePart = new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Kolkata' }).format(tomorrow);
       const tomorrowMidnight = `${tomorrowDatePart}T00:00:00`;
 
-      // 2. Fetch recent events from terminal (last 30)
-      const result = await this.eventsService.searchEvents({ maxResults: 30 });
-      const events = result.events || [];
+      // 2. Fetch today's events from terminal
+      const events = await this.eventsService.fetchAllEvents({
+        startTime: `${datePart}T00:00:00`,
+        endTime: `${datePart}T23:59:59`,
+      });
 
       // 3. Find unique employees who had an Access Granted event today
-      const failedMinors = [39, 76, 78, 33, 34, 37];
+      const successMinors = [38, 75, 104, 1];
       const todaySuccessEvents = events.filter((ev) => {
         if (!ev.employeeNo || ev.employeeNo === 'N/A') return false;
         if (ev.major !== 5) return false;
-        if (failedMinors.includes(ev.minor)) return false;
+        if (!successMinors.includes(ev.minor)) return false;
         return ev.deviceDate === datePart;
       });
 
@@ -65,6 +81,20 @@ export class ScanEnforcerService {
 
       for (const empNo of employeesWhoScannedToday) {
         try {
+          const userScans = todaySuccessEvents.filter((e) => String(e.employeeNo) === empNo);
+          const creditDate = this.enrollmentCredits.get(empNo);
+          const hasEnrollmentCredit = creditDate === datePart;
+
+          // If the user has an enrollment credit today and this is only their 1st scan,
+          // treat it as the reception verification scan and do not lock them out yet.
+          if (hasEnrollmentCredit && userScans.length <= 1) {
+            logger.info(
+              `[ScanEnforcer] User ${empNo} used 1st scan for enrollment test. Remaining scan today: 1.`
+            );
+            continue;
+          }
+
+          // User has completed their allowed check-in for today (1 scan for normal users, 2 scans for newly enrolled)
           const userRes = await this.usersService.searchUsers({ employeeNo: empNo, maxResults: 1 });
           const user = userRes.users?.[0];
           if (!user) continue;
@@ -75,7 +105,7 @@ export class ScanEnforcerService {
           if (!currentBeginTime || currentBeginTime < tomorrowMidnight) {
             const currentEndTime = userValid?.endTime || `${now.getFullYear() + 1}-12-31T23:59:59`;
             logger.info(
-              `[ScanEnforcer] User ${empNo} (${user.name}) successfully authenticated today. Advancing beginTime to ${tomorrowMidnight} to enforce 1-scan-per-day.`
+              `[ScanEnforcer] User ${empNo} (${user.name}) scanned ${userScans.length} time(s) today. Advancing beginTime to ${tomorrowMidnight} to enforce 1-scan-per-day.`
             );
 
             await this.usersService.updateAccessPeriod(
@@ -100,11 +130,39 @@ export class ScanEnforcerService {
   }
 
   /**
+   * Reset a single user's beginTime back to today (e.g. for reception re-entry or manual override)
+   */
+  public async resetUserToToday(employeeNo: string): Promise<boolean> {
+    const todayMidnight = `${new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Kolkata' }).format(new Date())}T00:00:00`;
+    try {
+      const userRes = await this.usersService.searchUsers({ employeeNo: String(employeeNo), maxResults: 1 });
+      const user = userRes.users?.[0];
+      if (!user) return false;
+
+      const userValid = user.Valid as any;
+      await this.usersService.updateAccessPeriod(
+        String(employeeNo),
+        todayMidnight,
+        userValid?.endTime || '2035-12-31T23:59:59',
+        user.userType !== 'blackList'
+      );
+      this.grantEnrollmentCredit(String(employeeNo));
+      logger.info(`[ScanEnforcer] User ${employeeNo} beginTime reset to today.`);
+      return true;
+    } catch (err) {
+      logger.warn(`[ScanEnforcer] Error resetting user ${employeeNo}:`, err);
+      return false;
+    }
+  }
+
+  /**
    * Reset all users' beginTime back to today (e.g. when toggling off 1-scan-per-day)
    */
   public async resetAllUsersToToday(): Promise<number> {
     const todayMidnight = `${new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Kolkata' }).format(new Date())}T00:00:00`;
     let count = 0;
+    this.enrollmentCredits.clear();
+
     try {
       const allUsers = await this.usersService.fetchAllUsers(50);
       for (const u of allUsers) {

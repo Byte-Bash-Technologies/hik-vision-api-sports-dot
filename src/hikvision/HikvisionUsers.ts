@@ -33,6 +33,7 @@ export interface SetUpUserParams {
   enabled?: boolean;
   gender?: string;
   doorNo?: number;
+  planTemplateNo?: string | number;
 }
 
 export interface EnrolledFingerprint {
@@ -154,7 +155,7 @@ export class HikvisionUsers {
         RightPlan: [
           {
             doorNo: params.doorNo || 1,
-            planTemplateNo: '1',
+            planTemplateNo: String(params.planTemplateNo || '2'),
           },
         ],
         gender: params.gender || 'male',
@@ -339,7 +340,11 @@ export class HikvisionUsers {
       },
     };
 
-    return this.client.post('/ISAPI/AccessControl/FingerPrint/SetUp?format=json', payload);
+    try {
+      return await this.client.post('/ISAPI/AccessControl/FingerPrintDownload?format=json', payload);
+    } catch {
+      return await this.client.post('/ISAPI/AccessControl/FingerPrint/SetUp?format=json', payload);
+    }
   }
 
   /**
@@ -389,14 +394,13 @@ export class HikvisionUsers {
    */
   public async deleteUserFingerprint(employeeNo: string, fingerPrintID = 1): Promise<any> {
     const payload = {
-      FingerPrintDeleteCond: {
-        EmployeeNoList: [
-          {
-            employeeNo: String(employeeNo),
-            enableCardReader: [1],
-            fingerPrintID: [fingerPrintID],
-          },
-        ],
+      FingerPrintDelete: {
+        mode: 'byEmployeeNo',
+        EmployeeNoDetail: {
+          employeeNo: String(employeeNo),
+          enableCardReader: [1],
+          fingerPrintID: [fingerPrintID],
+        },
       },
     };
 
