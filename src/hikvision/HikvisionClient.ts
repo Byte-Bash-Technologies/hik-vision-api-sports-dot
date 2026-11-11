@@ -3,6 +3,7 @@ import * as http from 'http';
 import { URL } from 'url';
 import { HikvisionAuth } from './HikvisionAuth';
 import { HikvisionConfig, HikvisionError } from './types';
+import { mockHikvisionHandler } from './MockHikvisionHandler';
 
 interface HttpResponse {
   statusCode: number;
@@ -15,6 +16,7 @@ export class HikvisionClient {
   private auth: HikvisionAuth;
   private httpsAgent: https.Agent;
   private httpAgent: http.Agent;
+  private pendingAuthRefresh: Promise<void> | null = null;
 
   constructor(config: HikvisionConfig) {
     this.config = {
@@ -23,14 +25,19 @@ export class HikvisionClient {
       password: config.password || '',
       verifyTls: config.verifyTls ?? false,
       timeoutMs: config.timeoutMs ?? 12000,
+      isMock: config.isMock ?? (process.env.HIKVISION_MOCK === 'true'),
     };
     this.auth = new HikvisionAuth();
     this.httpsAgent = new https.Agent({
       rejectUnauthorized: this.config.verifyTls,
-      keepAlive: false,
+      keepAlive: true,
+      keepAliveMsecs: 30000,
+      maxSockets: 4,
     });
     this.httpAgent = new http.Agent({
-      keepAlive: false,
+      keepAlive: true,
+      keepAliveMsecs: 30000,
+      maxSockets: 4,
     });
   }
 
@@ -43,10 +50,13 @@ export class HikvisionClient {
     if (partialConfig.verifyTls !== undefined) {
       this.httpsAgent = new https.Agent({
         rejectUnauthorized: this.config.verifyTls,
-        keepAlive: false,
+        keepAlive: true,
+        keepAliveMsecs: 30000,
+        maxSockets: 4,
       });
     }
     this.auth.resetChallenge();
+    this.pendingAuthRefresh = null;
   }
 
   public getConfig(): Omit<HikvisionConfig, 'password'> {
@@ -128,6 +138,10 @@ export class HikvisionClient {
     body?: unknown,
     retryCount = 0
   ): Promise<T> {
+    if (this.config.isMock || process.env.HIKVISION_MOCK === 'true') {
+      return mockHikvisionHandler.handleRequest(method, endpointPath, body) as T;
+    }
+
     const cleanPath = endpointPath.startsWith('/') ? endpointPath : `/${endpointPath}`;
     const targetUrl = new URL(`${this.config.host}${cleanPath}`);
     const uri = `${targetUrl.pathname}${targetUrl.search}`;
@@ -141,6 +155,10 @@ export class HikvisionClient {
       bodyStr = typeof body === 'string' ? body : JSON.stringify(body);
       headers['Content-Type'] = bodyStr.trim().startsWith('<') ? 'application/xml' : 'application/json';
       headers['Content-Length'] = Buffer.byteLength(bodyStr).toString();
+    }
+
+    if (this.pendingAuthRefresh && !this.auth.getChallenge()) {
+      await this.pendingAuthRefresh.catch(() => {});
     }
 
     if (this.auth.getChallenge()) {
@@ -157,7 +175,28 @@ export class HikvisionClient {
       }
     }
 
-    const response = await this.executeRequest(targetUrl, method, headers, bodyStr);
+    let response: HttpResponse;
+    if (!this.auth.getChallenge() && !this.pendingAuthRefresh) {
+      let resolveRefresh!: () => void;
+      this.pendingAuthRefresh = new Promise<void>((res) => {
+        resolveRefresh = res;
+      });
+      try {
+        response = await this.executeRequest(targetUrl, method, headers, bodyStr);
+        if (response.statusCode === 401) {
+          const authHeader = response.headers['www-authenticate'] || response.headers['WWW-Authenticate'];
+          const challengeStr = Array.isArray(authHeader) ? authHeader[0] : authHeader;
+          if (challengeStr) {
+            this.auth.parseChallenge(challengeStr);
+          }
+        }
+      } finally {
+        this.pendingAuthRefresh = null;
+        resolveRefresh();
+      }
+    } else {
+      response = await this.executeRequest(targetUrl, method, headers, bodyStr);
+    }
 
     if (response.statusCode === 401) {
       if (retryCount >= 2) {

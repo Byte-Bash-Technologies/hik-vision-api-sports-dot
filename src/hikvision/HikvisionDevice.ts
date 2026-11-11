@@ -11,27 +11,41 @@ export interface ParsedDeviceInfo {
 }
 
 export class HikvisionDevice {
+  private cachedDeviceInfo: { data: ParsedDeviceInfo; expiresAt: number } | null = null;
+  private static readonly DEVICE_INFO_TTL_MS = 5 * 60 * 1000;
+
   constructor(private client: HikvisionClient) {}
 
-  public async getDeviceInfo(): Promise<ParsedDeviceInfo> {
-    const raw = await this.client.get<any>('/ISAPI/System/deviceInfo?format=json');
-
-    if (typeof raw === 'string') {
-      return this.parseXmlDeviceInfo(raw);
+  public async getDeviceInfo(forceFresh = false): Promise<ParsedDeviceInfo> {
+    if (!forceFresh && this.cachedDeviceInfo && Date.now() < this.cachedDeviceInfo.expiresAt) {
+      return this.cachedDeviceInfo.data;
     }
 
-    const info = raw.DeviceInfo || raw;
-    return {
-      deviceName: info.deviceName || 'Access Controller',
-      model: info.model || 'DS-K1T320MFWX',
-      serialNumber: info.serialNumber || 'Unknown Serial',
-      firmwareVersion: info.firmwareVersion
-        ? `${info.firmwareVersion} ${info.firmwareReleasedDate || ''}`.trim()
-        : 'Unknown Firmware',
-      macAddress: info.macAddress,
-      deviceType: info.deviceType,
-      raw,
+    const raw = await this.client.get<any>('/ISAPI/System/deviceInfo?format=json');
+
+    let parsed: ParsedDeviceInfo;
+    if (typeof raw === 'string') {
+      parsed = this.parseXmlDeviceInfo(raw);
+    } else {
+      const info = raw.DeviceInfo || raw;
+      parsed = {
+        deviceName: info.deviceName || 'Access Controller',
+        model: info.model || 'DS-K1T320MFWX',
+        serialNumber: info.serialNumber || 'Unknown Serial',
+        firmwareVersion: info.firmwareVersion
+          ? `${info.firmwareVersion} ${info.firmwareReleasedDate || ''}`.trim()
+          : 'Unknown Firmware',
+        macAddress: info.macAddress,
+        deviceType: info.deviceType,
+        raw,
+      };
+    }
+
+    this.cachedDeviceInfo = {
+      data: parsed,
+      expiresAt: Date.now() + HikvisionDevice.DEVICE_INFO_TTL_MS,
     };
+    return parsed;
   }
 
   private parseXmlDeviceInfo(xml: string): ParsedDeviceInfo {
@@ -59,7 +73,7 @@ export class HikvisionDevice {
   }> {
     const startTime = Date.now();
     try {
-      const deviceInfo = await this.getDeviceInfo();
+      const deviceInfo = await this.getDeviceInfo(true);
       return {
         online: true,
         latencyMs: Date.now() - startTime,

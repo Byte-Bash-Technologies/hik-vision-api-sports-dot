@@ -1,19 +1,8 @@
 import { Router, Request, Response, NextFunction } from 'express';
-import { HikvisionClient, HikvisionUsers } from '../hikvision';
-import { config } from '../config';
+import { sharedUsersService as usersService } from '../hikvision';
 import { scanEnforcerService } from '../services/scanEnforcer.service';
 
 const router = Router();
-
-const client = new HikvisionClient({
-  host: config.HIKVISION_HOST,
-  username: config.HIKVISION_USERNAME,
-  password: config.HIKVISION_PASSWORD,
-  verifyTls: config.HIKVISION_VERIFY_TLS,
-  timeoutMs: config.HIKVISION_TIMEOUT,
-});
-
-const usersService = new HikvisionUsers(client);
 
 /**
  * Helper to map Hikvision UserInfo to standard HikUser format
@@ -45,26 +34,45 @@ function formatHikUser(u: any) {
  */
 router.get('/', async (req: Request, res: Response, next: NextFunction) => {
   try {
-    const position = req.query.position ? parseInt(req.query.position as string, 10) : 0;
-    const maxResults = req.query.maxResults ? parseInt(req.query.maxResults as string, 10) : 30;
+    const page = req.query.page ? parseInt(req.query.page as string, 10) : undefined;
+    const limit = req.query.limit ? parseInt(req.query.limit as string, 10) : undefined;
+    const maxResults = limit || (req.query.maxResults ? parseInt(req.query.maxResults as string, 10) : 30);
+    const position = req.query.position !== undefined
+      ? parseInt(req.query.position as string, 10)
+      : (page !== undefined ? Math.max(0, (page - 1) * maxResults) : 0);
     const employeeNo = req.query.employeeNo as string | undefined;
+    const search = (req.query.search as string | undefined)?.trim().toLowerCase();
 
-    const result = await usersService.searchUsers({
-      position,
-      maxResults,
-      employeeNo,
-    });
+    let formattedUsers: any[];
+    let totalMatches: number;
 
-    const formattedUsers = result.users.map(formatHikUser);
+    if (search && !employeeNo) {
+      const allUsers = await usersService.fetchAllUsers(30);
+      const filtered = allUsers.filter(
+        (u) =>
+          (u.name || '').toLowerCase().includes(search) ||
+          String(u.employeeNo || '').toLowerCase().includes(search)
+      );
+      totalMatches = filtered.length;
+      formattedUsers = filtered.slice(position, position + maxResults).map(formatHikUser);
+    } else {
+      const result = await usersService.searchUsers({
+        position,
+        maxResults,
+        employeeNo,
+      });
+      totalMatches = result.totalMatches;
+      formattedUsers = result.users.map(formatHikUser);
+    }
 
     res.json({
       success: true,
       data: formattedUsers,
       pagination: {
-        page: Math.floor(position / maxResults) + 1,
+        page: page !== undefined ? page : (Math.floor(position / maxResults) + 1),
         limit: maxResults,
-        total: result.totalMatches,
-        totalPages: Math.ceil(result.totalMatches / maxResults) || 1,
+        total: totalMatches,
+        totalPages: Math.ceil(totalMatches / maxResults) || 1,
       },
     });
   } catch (error) {

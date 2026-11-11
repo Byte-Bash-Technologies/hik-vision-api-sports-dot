@@ -1,30 +1,22 @@
-import { HikvisionClient, HikvisionEvents, HikvisionUsers, HikvisionDevice } from '../hikvision';
-import { config } from '../config';
+import {
+  sharedEventsService,
+  sharedUsersService,
+  sharedDeviceService,
+  HikvisionEvents,
+  HikvisionUsers,
+  HikvisionDevice,
+} from '../hikvision';
 import { logger } from '../utils/logger';
 import { scheduleConfigState } from './scheduleStore';
 
 export class ScanEnforcerService {
-  private client: HikvisionClient;
-  private eventsService: HikvisionEvents;
-  private usersService: HikvisionUsers;
-  private deviceService: HikvisionDevice;
+  private eventsService: HikvisionEvents = sharedEventsService;
+  private usersService: HikvisionUsers = sharedUsersService;
+  private deviceService: HikvisionDevice = sharedDeviceService;
   private isEnforcing = false;
 
   // Tracks newly enrolled members who get 1 test scan at reception before daily lockout starts (employeeNo -> YYYY-MM-DD)
   private enrollmentCredits = new Map<string, string>();
-
-  constructor() {
-    this.client = new HikvisionClient({
-      host: config.HIKVISION_HOST,
-      username: config.HIKVISION_USERNAME,
-      password: config.HIKVISION_PASSWORD,
-      verifyTls: config.HIKVISION_VERIFY_TLS,
-      timeoutMs: config.HIKVISION_TIMEOUT,
-    });
-    this.eventsService = new HikvisionEvents(this.client);
-    this.usersService = new HikvisionUsers(this.client);
-    this.deviceService = new HikvisionDevice(this.client);
-  }
 
   /**
    * Grant 1 enrollment test credit to a member upon creation or biometric capture.

@@ -1,20 +1,32 @@
 import { Router, Request, Response, NextFunction } from 'express';
-import { HikvisionClient, HikvisionEvents } from '../hikvision';
-import { config } from '../config';
+import { sharedEventsService as eventsService, FormattedEventItem } from '../hikvision';
 
 const router = Router();
 
-const client = new HikvisionClient({
-  host: config.HIKVISION_HOST,
-  username: config.HIKVISION_USERNAME,
-  password: config.HIKVISION_PASSWORD,
-  verifyTls: config.HIKVISION_VERIFY_TLS,
-  timeoutMs: config.HIKVISION_TIMEOUT,
-});
-
-const eventsService = new HikvisionEvents(client);
-
 import { scheduleConfigState } from '../services/scheduleStore';
+
+// Short-lived (5s) shared day-events cache + in-flight deduplication so parallel
+// /attendance and /attendance/summary requests for the same date share one terminal query.
+const dayEventsCache = new Map<string, { expiresAt: number; promise: Promise<FormattedEventItem[]> }>();
+const DAY_CACHE_TTL_MS = 5000;
+
+async function getDayEventsCached(filterDate: string, startTime: string, endTime: string, employeeNo?: string): Promise<FormattedEventItem[]> {
+  const key = `${filterDate}|${startTime}|${endTime}|${employeeNo || ''}`;
+  const existing = dayEventsCache.get(key);
+  if (existing && Date.now() < existing.expiresAt) {
+    return existing.promise;
+  }
+
+  const promise = eventsService
+    .fetchAllEvents({ startTime, endTime, employeeNo })
+    .catch((err) => {
+      dayEventsCache.delete(key);
+      throw err;
+    });
+
+  dayEventsCache.set(key, { expiresAt: Date.now() + DAY_CACHE_TTL_MS, promise });
+  return promise;
+}
 
 /**
  * Helper to map raw event to rich HikAttendanceEvent with Shift tagging
@@ -81,8 +93,12 @@ function mapToHikAttendanceEvent(ev: any) {
  */
 router.get('/', async (req: Request, res: Response, next: NextFunction) => {
   try {
-    const position = req.query.position ? parseInt(req.query.position as string, 10) : 0;
-    const maxResults = req.query.maxResults ? parseInt(req.query.maxResults as string, 10) : 50;
+    const page = req.query.page ? parseInt(req.query.page as string, 10) : undefined;
+    const limit = req.query.limit ? parseInt(req.query.limit as string, 10) : undefined;
+    const maxResults = limit || (req.query.maxResults ? parseInt(req.query.maxResults as string, 10) : 50);
+    const position = req.query.position !== undefined
+      ? parseInt(req.query.position as string, 10)
+      : (page !== undefined ? Math.max(0, (page - 1) * maxResults) : 0);
     const date = req.query.date as string | undefined;
     const shift = req.query.shift as string | undefined;
     const todayStr = new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Kolkata' }).format(new Date());
@@ -92,18 +108,44 @@ router.get('/', async (req: Request, res: Response, next: NextFunction) => {
     const employeeNo = (req.query.employeeNo as string) || (req.query.employeeNoString as string);
     const search = req.query.search as string | undefined;
 
-    let rawEvents: any[];
+    let pagedEvents: any[];
     let totalCount = 0;
 
     if (filterDate) {
-      const allDay = await eventsService.fetchAllEvents({
-        startTime,
-        endTime,
-        employeeNo,
-      });
-      totalCount = allDay.length;
-      allDay.sort((a, b) => new Date(b.time).getTime() - new Date(a.time).getTime());
-      rawEvents = allDay.slice(position, position + maxResults);
+      const allDayRaw = await getDayEventsCached(
+        filterDate,
+        startTime || `${filterDate}T00:00:00`,
+        endTime || `${filterDate}T23:59:59`,
+        employeeNo
+      );
+      const allDay = [...allDayRaw].sort((a, b) => new Date(b.time).getTime() - new Date(a.time).getTime());
+
+      let mapped = allDay.map(mapToHikAttendanceEvent);
+      mapped = mapped.filter((ev) => ev.dateFormatted === filterDate);
+
+      if (shift && shift !== 'ALL') {
+        if (shift === 'MORNING') {
+          mapped = mapped.filter((ev) => ev.shift === 'MORNING');
+        } else if (shift === 'EVENING') {
+          mapped = mapped.filter((ev) => ev.shift === 'EVENING');
+        } else if (shift === 'DENIED') {
+          mapped = mapped.filter((ev) => ev.status === 'FAILED');
+        }
+      }
+      if (employeeNo) {
+        mapped = mapped.filter((ev) => String(ev.employeeNo) === String(employeeNo));
+      }
+      if (search) {
+        const q = search.toLowerCase();
+        mapped = mapped.filter(
+          (ev) =>
+            ev.employeeName?.toLowerCase().includes(q) ||
+            ev.employeeNo?.toLowerCase().includes(q)
+        );
+      }
+
+      totalCount = mapped.length;
+      pagedEvents = mapped.slice(position, position + maxResults);
     } else {
       const init = await eventsService.searchEvents({ maxResults: 1 });
       const overallTotal = Number(init.totalMatches || 0);
@@ -114,41 +156,37 @@ router.get('/', async (req: Request, res: Response, next: NextFunction) => {
         employeeNo,
       });
       totalCount = overallTotal;
-      rawEvents = [...result.events].reverse();
-    }
+      const rawEvents = [...result.events].reverse();
+      let mapped = rawEvents.map(mapToHikAttendanceEvent);
 
-    let mapped = rawEvents.map(mapToHikAttendanceEvent);
-
-    if (filterDate) {
-      mapped = mapped.filter((ev) => ev.dateFormatted === filterDate);
-    }
-
-    if (shift && shift !== 'ALL') {
-      if (shift === 'MORNING') {
-        mapped = mapped.filter((ev) => ev.shift === 'MORNING');
-      } else if (shift === 'EVENING') {
-        mapped = mapped.filter((ev) => ev.shift === 'EVENING');
-      } else if (shift === 'DENIED') {
-        mapped = mapped.filter((ev) => ev.status === 'FAILED');
+      if (shift && shift !== 'ALL') {
+        if (shift === 'MORNING') {
+          mapped = mapped.filter((ev) => ev.shift === 'MORNING');
+        } else if (shift === 'EVENING') {
+          mapped = mapped.filter((ev) => ev.shift === 'EVENING');
+        } else if (shift === 'DENIED') {
+          mapped = mapped.filter((ev) => ev.status === 'FAILED');
+        }
       }
-    }
-    if (employeeNo) {
-      mapped = mapped.filter((ev) => String(ev.employeeNo) === String(employeeNo));
-    }
-    if (search) {
-      const q = search.toLowerCase();
-      mapped = mapped.filter(
-        (ev) =>
-          ev.employeeName?.toLowerCase().includes(q) ||
-          ev.employeeNo?.toLowerCase().includes(q)
-      );
+      if (employeeNo) {
+        mapped = mapped.filter((ev) => String(ev.employeeNo) === String(employeeNo));
+      }
+      if (search) {
+        const q = search.toLowerCase();
+        mapped = mapped.filter(
+          (ev) =>
+            ev.employeeName?.toLowerCase().includes(q) ||
+            ev.employeeNo?.toLowerCase().includes(q)
+        );
+      }
+      pagedEvents = mapped;
     }
 
     res.json({
       success: true,
-      data: mapped,
+      data: pagedEvents,
       pagination: {
-        page: Math.floor(position / maxResults) + 1,
+        page: page !== undefined ? page : (Math.floor(position / maxResults) + 1),
         limit: maxResults,
         total: totalCount,
         totalPages: Math.ceil(totalCount / maxResults) || 1,
@@ -168,6 +206,7 @@ import { scanEnforcerService } from '../services/scanEnforcer.service';
 router.post('/sync', async (req: Request, res: Response, next: NextFunction) => {
   const start = Date.now();
   try {
+    dayEventsCache.clear();
     const events = await eventsService.fetchAllEvents({ maxResults: 30 });
     const { enforcedUsers } = await scanEnforcerService.enforce();
 
@@ -221,10 +260,11 @@ router.get('/summary', async (req: Request, res: Response, next: NextFunction) =
   try {
     const targetDate = (req.query.date as string) || new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Kolkata' }).format(new Date());
 
-    const events = await eventsService.fetchAllEvents({
-      startTime: `${targetDate}T00:00:00`,
-      endTime: `${targetDate}T23:59:59`,
-    });
+    const events = await getDayEventsCached(
+      targetDate,
+      `${targetDate}T00:00:00`,
+      `${targetDate}T23:59:59`
+    );
 
     const dayEvents = events.filter((e) => e.deviceDate === targetDate || !e.deviceDate);
 
@@ -296,19 +336,31 @@ router.get('/user/:employeeNo', async (req: Request, res: Response, next: NextFu
     });
 
     const total = Number(init.totalMatches || 0);
-    const pos = Math.max(0, total - limit);
+    if (total === 0) {
+      res.json({
+        success: true,
+        employeeNo,
+        count: 0,
+        data: [],
+      });
+      return;
+    }
 
-    const result = await eventsService.searchEvents({
-      position: pos,
-      maxResults: limit,
-      employeeNo,
-    });
+    const pos = Math.max(0, total - limit);
+    const result = total <= 1
+      ? init
+      : await eventsService.searchEvents({
+          position: pos,
+          maxResults: limit,
+          employeeNo,
+        });
 
     let events = result.events;
-    // Fallback if terminal didn't filter in hardware condition
-    if (events.length === 0 || events.some((e) => e.employeeNo && String(e.employeeNo) !== String(employeeNo))) {
-      const allEvents = await eventsService.fetchAllEvents();
-      events = allEvents.filter((ev) => String(ev.employeeNo) === String(employeeNo));
+    // Only fall back to a bounded recent scan if hardware ignored employeeNo and returned mismatched users.
+    // Never scan the full history when total === 0 (that simply means the member has 0 punches).
+    if (events.some((e) => e.employeeNo && String(e.employeeNo) !== String(employeeNo))) {
+      const recentEvents = await eventsService.fetchAllEvents({ maxResults: 120 });
+      events = recentEvents.filter((ev) => String(ev.employeeNo) === String(employeeNo));
     }
 
     const mapped = events

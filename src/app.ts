@@ -14,9 +14,14 @@ import dashboardRoutes from './routes/dashboard.routes';
 
 const app = express();
 
-// Security and CORS for mobile and web apps
-app.use(helmet());
-app.use(cors({ origin: '*' }));
+// Security and CORS for cross-account mobile and web apps
+app.use(helmet({ crossOriginResourcePolicy: false }));
+app.use(cors({
+  origin: '*',
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'x-api-key'],
+  maxAge: 86400, // Cache preflight for 24 hours to eliminate repeated OPTIONS requests
+}));
 app.use(express.json());
 
 // Rate limiter: 150 requests per minute

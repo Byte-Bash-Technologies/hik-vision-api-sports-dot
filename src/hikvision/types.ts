@@ -4,6 +4,7 @@ export interface HikvisionConfig {
   password?: string;
   verifyTls?: boolean;
   timeoutMs?: number;
+  isMock?: boolean;
 }
 
 export interface DigestChallenge {

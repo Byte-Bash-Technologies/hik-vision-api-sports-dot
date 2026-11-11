@@ -1,6 +1,9 @@
 import dotenv from 'dotenv';
+import path from 'path';
 import { z } from 'zod';
 
+// Load .env.local first if available, followed by .env
+dotenv.config({ path: path.resolve(process.cwd(), '.env.local') });
 dotenv.config();
 
 const envSchema = z.object({
@@ -15,6 +18,10 @@ const envSchema = z.object({
     .string()
     .transform((val) => parseInt(val, 10))
     .default('12000'),
+  HIKVISION_MOCK: z
+    .string()
+    .transform((val) => val === 'true')
+    .default('false'),
   PORT: z
     .string()
     .transform((val) => parseInt(val, 10))

@@ -1,20 +1,12 @@
 import { Router, Request, Response, NextFunction } from 'express';
-import { HikvisionClient, HikvisionDevice, HikvisionUsers, HikvisionEvents } from '../hikvision';
+import {
+  sharedDeviceService as deviceService,
+  sharedUsersService as usersService,
+  sharedEventsService as eventsService,
+} from '../hikvision';
 import { config } from '../config';
 
 const router = Router();
-
-const client = new HikvisionClient({
-  host: config.HIKVISION_HOST,
-  username: config.HIKVISION_USERNAME,
-  password: config.HIKVISION_PASSWORD,
-  verifyTls: config.HIKVISION_VERIFY_TLS,
-  timeoutMs: config.HIKVISION_TIMEOUT,
-});
-
-const deviceService = new HikvisionDevice(client);
-const usersService = new HikvisionUsers(client);
-const eventsService = new HikvisionEvents(client);
 
 /**
  * GET /api/device
